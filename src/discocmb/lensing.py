@@ -1,30 +1,28 @@
 """Weak lensing of the CMB temperature and polarization spectra.
 
-Two pieces, both batched over cosmologies:
+Two parts, both batched over cosmologies:
 
-1. **The lensing potential power spectrum** ``C_l^{psi psi}`` from the Weyl
-   potential the perturbation kernel records at the save times (the fourth
-   source channel of :mod:`discocmb.sources`).  The lensing potential is the
-   line-of-sight integral of the Weyl potential against the lensing kernel
-   (Lewis & Challinor 2006, eq. 4.6; CAMB's ``sources(3)``):
+1. **Lensing potential spectrum** ``C_l^{psi psi}``, from the Weyl potential
+   the kernel saves (the fourth source channel of :mod:`discocmb.sources`).
+   The lensing potential integrates the Weyl potential along the line of
+   sight (Lewis & Challinor 2006, eq. 4.6, CAMB's ``sources(3)``):
 
    ``psi(n) = -2 int_0^{chi_*} dchi (chi_* - chi) / (chi chi_*) phi_W(chi n, tau_0 - chi)``,
 
    so ``Theta_l^psi(k) = -2 int dchi W(chi) phi_W(k, tau_0 - chi) j_l(k chi)``
    and ``C_l^{psi psi} = 4 pi int dln k P_R(k) |Theta_l^psi(k)|^2``, with the
-   same primordial normalization as the temperature spectrum of
-   :func:`discocmb.spectra.cl_from_theta`.  The kernel is broad in ``chi``, so the
-   transfer function is smooth in ``k`` and the modes the hierarchy was solved
-   on suffice for the quadrature (no refinement onto the fine grid), and the
-   projection is a small matrix product per cosmology
-   (:func:`lensing_potential_operator`, :func:`lensing_potential_transfer`).
+   normalization of :func:`discocmb.spectra.cl_from_theta`. The kernel is
+   broad in ``chi``, so the transfer function is smooth in ``k``. The solved
+   modes suffice for the quadrature, and the projection is a small matrix
+   product per cosmology (:func:`lensing_potential_operator`,
+   :func:`lensing_potential_transfer`).
 
-2. **The lensed spectra** by the full-sky correlation-function method of
-   Challinor & Lewis (2005, Phys. Rev. D 71, 103010), the method of CAMB and
-   CLASS, in the form of CAMB's ``CorrFuncFullSky``: the isotropic part of the
-   deflection is kept to all orders, ``F_l = exp(-l(l+1) sigma^2/2)``, and the
-   anisotropic part to second order in ``c_l = l(l+1) C_gl,2 / 2``.  With
-   ``b_l = (2l+1)/(4pi)`` the lensed correlation functions are
+2. **Lensed spectra**, by the full-sky correlation-function method of
+   Challinor & Lewis (2005, Phys. Rev. D 71, 103010) in the form of CAMB's
+   ``CorrFuncFullSky``. It keeps the isotropic part of the deflection to all
+   orders, ``F_l = exp(-l(l+1) sigma^2/2)``, and the anisotropic part to
+   second order in ``c_l = l(l+1) C_gl,2 / 2``. With ``b_l = (2l+1)/(4pi)``
+   the lensed correlation functions are
 
    ``xi   = sum_l b_l C_l^TT F_l [d_00 + c_l d_{1-1} + c_l^2/4 (d_00 + d_{2-2})]``,
    ``xi_+ = sum_l b_l C_l^EE F_l [d_22 + c_l d_13 + c_l^2/4 (d_22 + d_04)]``,
@@ -33,15 +31,14 @@ Two pieces, both batched over cosmologies:
 
    where ``d_{mm'} = d^l_{mm'}(beta)`` are Wigner d-functions,
    ``sigma^2(beta) = C_gl(0) - C_gl(beta)``, ``C_gl = sum_l b_l l(l+1) C_l^psi
-   d^l_11`` and ``C_gl,2`` the same sum with ``d^l_{1-1}``.  The lensed
-   spectra are the transforms back by Gauss-Legendre quadrature in
-   ``cos(beta)``: ``C~_l^TT = 2 pi int xi d^l_00``, ``C~_l^TE = 2 pi int xi_X
-   d^l_20``, ``C~_l^EE +- C~_l^BB = 2 pi int xi_+- d^l_{2 +-2}``.  The
-   d-functions on the quadrature nodes depend on nothing but ``l_max`` and the
-   number of nodes and are tabulated once (:func:`lensing_tables`);
-   :func:`lensed_spectra` is then a few dozen matrix products per cosmology
-   and runs batched on the device.  It sums over every multipole;
-   :func:`cl_on_every_ell` splines the sampled spectra onto them.
+   d^l_11`` and ``C_gl,2`` is the same sum with ``d^l_{1-1}``. Gauss-Legendre
+   quadrature in ``cos(beta)`` transforms them back: ``C~_l^TT = 2 pi int xi
+   d^l_00``, ``C~_l^TE = 2 pi int xi_X d^l_20``, ``C~_l^EE +- C~_l^BB = 2 pi
+   int xi_+- d^l_{2 +-2}``. The d-functions depend only on ``l_max`` and the
+   node count, so :func:`lensing_tables` builds them once.
+   :func:`lensed_spectra` then needs a few dozen matrix products per
+   cosmology. It sums over every multipole, and :func:`cl_on_every_ell`
+   splines the sampled spectra onto them.
 """
 
 from __future__ import annotations
@@ -67,12 +64,12 @@ from .transfer import (
 
 
 def lensing_potential_operator(ells, k_values, tau_save, tau0_ref, dtype=jnp.float32):
-    """``(n_ell, n_k, n_chi)`` table of ``j_l(k chi)`` with the ``chi`` trapezoid weights folded in.
+    """Return the ``(n_ell, n_k, n_chi)`` table of ``j_l(k chi)`` times the ``chi`` trapezoid weights.
 
-    ``chi = tau0_ref - tau_save`` is the shared comoving-distance grid the
-    sources are shifted onto; the per-cosmology lensing kernel is applied in
-    :func:`lensing_potential_transfer`.  Built on the host with SciPy's spherical
-    Bessel functions (a second or so for 60 multipoles and 128 modes).
+    ``chi = tau0_ref - tau_save`` is the shared comoving-distance grid.
+    :func:`lensing_potential_transfer` applies each cosmology's lensing
+    kernel. SciPy builds the table on the host in about a second for 60
+    multipoles and 128 modes.
     """
 
     ells = np.asarray(ells, dtype=np.int64)
@@ -86,20 +83,19 @@ def lensing_potential_operator(ells, k_values, tau_save, tau0_ref, dtype=jnp.flo
 
 
 LIMBER_LMIN = 200
-"""Multipole from which the lensing potential is projected in the Limber approximation.
+"""First multipole of the lensing potential to use the Limber approximation.
 
-The exact line-of-sight integral needs the save grid to resolve ``j_l(k chi)``
-along the whole line of sight, and the late-time part of the grid is coarse
-(it is shaped for recombination); the Limber integrand is smooth in ``chi``.
-Against CLASS the exact projection is good to 0.2 percent below ``l ~ 300``
-and the Limber one to 0.3 percent above ``l ~ 200``.
+The exact integral needs the save grid to resolve ``j_l(k chi)`` along the
+whole line of sight, but the grid is coarse at late times. The Limber
+integrand is smooth in ``chi``. Against CLASS the exact projection agrees to
+0.2 percent below ``l ~ 300`` and Limber to 0.3 percent above ``l ~ 200``.
 """
 
 
 def limber_wavenumbers(ells, chi):
-    """``k_chi = (l + 1/2) / chi``, ``(n_ell, n_chi)``, the wave number a Limber multipole sees at ``chi``.
+    """Return ``k_chi = (l + 1/2) / chi``, ``(n_ell, n_chi)``, the Limber wave number at ``chi``.
 
-    Where ``chi <= 0`` the distance is taken as 1; those points carry no weight.
+    Points with ``chi <= 0`` use a distance of 1. They carry no weight.
     """
 
     chi = np.asarray(chi, dtype=np.float64)
@@ -108,9 +104,9 @@ def limber_wavenumbers(ells, chi):
 
 
 def limber_interpolation(ells, k_values, chi):
-    """``(n_ell, n_chi, n_k)`` cubic-spline weights in ``ln k`` taking the modes to ``k = (l + 1/2) / chi``.
+    """Return ``(n_ell, n_chi, n_k)`` cubic spline weights in ``ln k`` from the modes to ``k = (l + 1/2) / chi``.
 
-    Targets outside the solved modes get zero weight (no contribution).
+    Targets outside the solved modes get zero weight.
     """
 
     from discoeb.spline_interpolation import spline_interpolation
@@ -150,24 +146,24 @@ def lensing_potential_transfer(
     limber_weights,
     k_chi,
 ):
-    """The primordial-spectrum-independent half of ``C_l^{psi psi}`` for a batch.
+    """Return ``(theta_psi, limber)``, the part of ``C_l^{psi psi}`` before ``P_R(k)``.
 
-    ``phi`` is the Weyl potential channel ``(n_c, n_k, n_tau)`` on the save
-    grid; ``shift_idx`` and ``shift_w`` are each cosmology's stencil onto the
-    shared ``chi`` grid (:func:`discocmb.transfer.lagrange_shift_stencil`), ``chi``
-    the shared grid ``(n_chi,)``, ``chi_star`` the comoving distance to each
-    cosmology's visibility peak ``(n_c,)``, ``operator`` the table of
-    :func:`lensing_potential_operator` for the multipoles projected exactly,
-    ``limber_weights`` the table of :func:`limber_interpolation` and
-    ``k_chi`` the :func:`limber_wavenumbers` of the multipoles projected in
-    the Limber approximation.
+    Inputs:
 
-    Returns ``(theta_psi, limber)``: the lensing-potential transfer function
-    ``Theta_l(k)`` at the solved modes for the multipoles projected exactly,
-    ``(n_c, n_ell_exact, n_k)``, and for the Limber multipoles the integrand
-    ``S(k_chi, chi)^2 dchi / (k_chi^3 chi^2)`` on the ``chi`` grid, ``(n_c,
-    n_ell_limber, n_chi)``, zero where ``chi <= 0``; the primordial spectrum
-    multiplies both pointwise in ``k`` (:func:`lensing_potential_cl_from_transfer`).
+    * ``phi``: the Weyl potential channel ``(n_c, n_k, n_tau)``.
+    * ``shift_idx``, ``shift_w``: each cosmology's stencil onto the shared
+      ``chi`` grid (:func:`discocmb.transfer.lagrange_shift_stencil`).
+    * ``chi``: the shared grid ``(n_chi,)``.
+    * ``chi_star``: distance to each visibility peak ``(n_c,)``.
+    * ``operator``: :func:`lensing_potential_operator` for the exact multipoles.
+    * ``limber_weights``, ``k_chi``: :func:`limber_interpolation` and
+      :func:`limber_wavenumbers` for the Limber multipoles.
+
+    ``theta_psi`` is the exact transfer function ``Theta_l(k)`` at the solved
+    modes, ``(n_c, n_ell_exact, n_k)``. ``limber`` is the Limber integrand
+    ``S(k_chi, chi)^2 dchi / (k_chi^3 chi^2)``, ``(n_c, n_ell_limber,
+    n_chi)``, zero where ``chi <= 0``.
+    :func:`lensing_potential_cl_from_transfer` multiplies both by ``P_R``.
     """
 
     hi = jax.lax.Precision.HIGHEST
@@ -194,7 +190,7 @@ def lensing_potential_transfer(
 def lensing_potential_cl_from_transfer(
     theta_psi, limber, k_chi, k_values, n_s, A_s, k_pivot
 ):
-    """``C_l^{psi psi}`` ``(n_c, n_ell_exact + n_ell_limber)`` from :func:`lensing_potential_transfer` and the primordial spectrum."""
+    """Return ``C_l^{psi psi}``, ``(n_c, n_ell_exact + n_ell_limber)``, from :func:`lensing_potential_transfer` and ``P_R(k)``."""
 
     primordial = primordial_spectrum(k_values, n_s, A_s, k_pivot)
     # Exact projection: C_l = 4 pi int dln k P_R(k) Theta_l(k)^2.
@@ -208,11 +204,11 @@ def lensing_potential_cl_from_transfer(
 
 @array_cache
 def lensing_operators(ells, k_sorted, tau_save, tau0_ref, dtype):
-    """The exact-projection table, the Limber weights and the Limber ``k_chi``, cached per grids.
+    """Return the exact table, the Limber weights and the Limber ``k_chi``, cached per grid set.
 
-    Multipoles below :data:`LIMBER_LMIN` are projected exactly,
-    the rest in the Limber approximation; ``ells`` must be sorted, and every
-    array a NumPy one (the cache key).
+    Multipoles below :data:`LIMBER_LMIN` use the exact projection, the rest
+    Limber. ``ells`` must be sorted, and every array must be a NumPy array
+    because the cache keys on them.
     """
 
     exact, limber = ells[ells < LIMBER_LMIN], ells[ells >= LIMBER_LMIN]
@@ -232,8 +228,9 @@ def lensing_operators(ells, k_sorted, tau_save, tau0_ref, dtype):
 class LensingTables(NamedTuple):
     """Gauss-Legendre nodes and the Wigner d-functions on them, for :func:`lensed_spectra`.
 
-    Each table is ``d^l_{mm'}(beta)`` for ``l = 0..lmax`` on the nodes ``x = cos(beta)``,
-    shape ``(lmax + 1, n)``; the name gives ``m m'`` with ``m`` for ``-m``.
+    Each table holds ``d^l_{mm'}(beta)`` for ``l = 0..lmax`` on the nodes
+    ``x = cos(beta)``, shape ``(lmax + 1, n)``. The name spells ``m m'``, with
+    ``m`` standing for a minus sign.
     """
 
     lmax: int
@@ -267,14 +264,14 @@ D_TABLES = (
     (1, -3),
     (2, -4),
 )
-"""The ``(m, m')`` of the d-function tables of :class:`LensingTables`, in field order."""
+"""``(m, m')`` of each d-function table in :class:`LensingTables`, in field order."""
 
 
 def _wigner_d_start(m, mp, x):
-    """``d^j_{m m'}(beta)`` at the lowest ``j = max(|m|, |m'|)``, from the closed form.
+    """Return ``d^j_{m m'}(beta)`` at the lowest ``j = max(|m|, |m'|)`` from the closed form.
 
     ``d^j_{j mu} = sqrt((2j)! / ((j+mu)! (j-mu)!)) cos^{j+mu}(beta/2) (-sin(beta/2))^{j-mu}``,
-    reached through the symmetries ``d^j_{m m'} = (-1)^{m-m'} d^j_{m' m} = d^j_{-m -m'}``.
+    mapped to ``m, m'`` by ``d^j_{m m'} = (-1)^{m-m'} d^j_{m' m} = d^j_{-m -m'}``.
     """
 
     from math import factorial
@@ -293,7 +290,7 @@ def _wigner_d_start(m, mp, x):
 
 
 def _wigner_d(m, mp, x, lmax):
-    """``d^l_{m m'}(beta)`` for ``l = 0..lmax`` on ``x = cos(beta)``, by upward recursion in ``l``."""
+    """Return ``d^l_{m m'}(beta)`` for ``l = 0..lmax`` on ``x = cos(beta)`` by upward recursion."""
 
     x = np.asarray(x, dtype=np.float64)
     out = np.zeros((lmax + 1, len(x)))
@@ -302,7 +299,7 @@ def _wigner_d(m, mp, x, lmax):
         return out
     out[l0] = _wigner_d_start(m, mp, x)
     prev = np.zeros_like(x)
-    if l0 == 0:  # the recursion divides by l; seed it with d^1_00 = cos(beta)
+    if l0 == 0:  # the recursion divides by l, so seed it with d^1_00 = cos(beta)
         if lmax == 0:
             return out
         out[1], prev, l0 = x, out[0], 1
@@ -319,12 +316,12 @@ def _wigner_d(m, mp, x, lmax):
 def lensing_tables(
     lmax: int, n_points: int | None = None, dtype=jnp.float32
 ) -> LensingTables:
-    """Tabulate the quadrature and the d-functions for :func:`lensed_spectra`.
+    """Tabulate the quadrature and d-functions for :func:`lensed_spectra`.
 
-    ``n_points`` Gauss-Legendre nodes in ``cos(beta)`` (``lmax + 1024`` by
-    default, which resolves the lensed correlation functions to better than
-    1e-4 of the spectra).  Takes several seconds of host time for ``lmax ~
-    3000`` and ~600 MB on the device in float32 (twelve tables).
+    ``n_points`` sets the Gauss-Legendre nodes in ``cos(beta)``. The default,
+    ``lmax + 1024``, resolves the correlation functions to better than 1e-4 of
+    the spectra. At ``lmax ~ 3000`` this takes several seconds on the host and
+    ~600 MB on the device in float32.
     """
 
     n = n_points or (lmax + 1024)
@@ -338,16 +335,15 @@ def lensing_tables(
 
 
 def cl_on_every_ell(ells, cl, lmax: int, power: int = 1):
-    """``C_l`` at every ``l = 0..lmax``, ``(n_c, lmax + 1)``, from samples ``(n_c, n_ell)`` at sorted ``ells``.
+    """Return ``C_l`` at every ``l = 0..lmax``, ``(n_c, lmax + 1)``, from samples ``(n_c, n_ell)`` at sorted ``ells``.
 
-    :func:`lensed_spectra` sums over every multipole, the spectra are computed at a
-    few dozen; this is a natural cubic spline in ``ln l`` of
-    ``[l(l+1)]^power C_l`` (``power = 1`` for the temperature and polarization
-    spectra, 2 for the lensing potential, so that the splined quantity is
-    flat), zero below ``ells[0]``. ``ells[-1]`` must reach ``lmax``. Multipoles
-    the spline must bridge where the spectrum curves sharply in ``ln l`` cost
-    accuracy: a temperature sampled at ``l = 2, 4`` is off by 5e-3 at ``l = 3``,
-    so sample every multipole there.
+    :func:`lensed_spectra` needs every multipole, but the pipeline computes a
+    few dozen. This fits a natural cubic spline in ``ln l`` to
+    ``[l(l+1)]^power C_l``, which is nearly flat for ``power = 1`` (CMB
+    spectra) and ``power = 2`` (lensing potential). The result is zero below
+    ``ells[0]``, and ``ells[-1]`` must reach ``lmax``. Gaps where the spectrum
+    curves sharply cost accuracy. Sampling TT at ``l = 2, 4`` misses ``l = 3``
+    by 5e-3, so sample every multipole there.
     """
 
     from discoeb.spline_interpolation import spline_interpolation
@@ -369,7 +365,7 @@ def cl_on_every_ell(ells, cl, lmax: int, power: int = 1):
 
 
 class LensedSpectra(NamedTuple):
-    """The lensed spectra of :func:`lensed_spectra`, each ``(n_c, lmax + 1)``."""
+    """Lensed spectra from :func:`lensed_spectra`, each ``(n_c, lmax + 1)``."""
 
     tt: jax.Array
     te: jax.Array
@@ -378,7 +374,7 @@ class LensedSpectra(NamedTuple):
 
 
 def _lensed_one(cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables):
-    """Lensed ``(TT, TE, EE, BB)`` for ``l = 0..lmax`` of one cosmology (float64 in, float64 out)."""
+    """Return lensed ``(TT, TE, EE, BB)`` for ``l = 0..lmax`` of one cosmology in float64."""
 
     hi = jax.lax.Precision.HIGHEST
     dtype = tables.d00.dtype
@@ -395,8 +391,8 @@ def _lensed_one(cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables):
     damping = jnp.exp(
         -0.5 * llp1.astype(dtype)[:, None] * sigma2[None, :]
     )  # F_l, (l, n)
-    # The anisotropic expansion parameter is c_l = h_l C_gl,2 with h_l = l(l+1)/2:
-    # every term is F_l times a power of C_gl,2(beta) times a sum over l.
+    # The anisotropic expansion parameter is c_l = h_l C_gl,2 with h_l = l(l+1)/2.
+    # Each term is F_l times a power of C_gl,2(beta) times a sum over l.
     h = 0.5 * llp1
     b_t, b_x, b_e = (norm * cl_tt, norm * cl_te, norm * cl_ee)
 
@@ -453,16 +449,16 @@ def _lensed_one(cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables):
 def lensed_spectra(
     cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables, chunk: int = 4
 ) -> LensedSpectra:
-    """Lensed ``TT, TE, EE, BB`` for a batch, a :class:`LensedSpectra` of ``(n_c, lmax + 1)`` arrays.
+    """Return lensed ``TT, TE, EE, BB`` for a batch as a :class:`LensedSpectra` of ``(n_c, lmax + 1)``.
 
-    ``cl_tt``, ``cl_te`` and ``cl_ee`` are the unlensed scalar spectra and
-    ``cl_pp`` the lensing potential spectrum, ``(n_c, lmax + 1)`` indexed by
-    ``l`` from 0 (the monopole and dipole are ignored; :func:`cl_on_every_ell`
-    fills them in from the sampled spectra of
-    :func:`discocmb.main.compute_cl_power_spectrum_batch`).  The unlensed
-    spectra must extend a few hundred multipoles past the highest lensed
-    multipole wanted.  Cosmologies are processed ``chunk`` at a time: the
-    per-cosmology work is an ``(lmax + 1, n_points)`` array of damping factors.
+    ``cl_tt``, ``cl_te``, ``cl_ee`` (unlensed) and ``cl_pp`` (lensing
+    potential) are ``(n_c, lmax + 1)``, indexed by ``l`` from 0. The function
+    ignores the monopole and dipole. :func:`cl_on_every_ell` fills these
+    arrays from the sampled output of
+    :func:`discocmb.main.compute_cl_power_spectrum_batch`. The unlensed
+    spectra must run a few hundred multipoles past the highest lensed one you
+    need. It handles ``chunk`` cosmologies at a time, since each needs an
+    ``(lmax + 1, n_points)`` array of damping factors.
     """
 
     spectra = [

@@ -1,12 +1,12 @@
-"""The grids of a CMB computation, shaped by a fiducial cosmology.
+"""Grids for a CMB computation, shaped by a fiducial cosmology.
 
-The sources have structure at recombination and on the sound-horizon scale in
-``tau``, and at the acoustic scale and the Silk damping scale in ``k``; the
-grids here are dense where that structure is (:func:`cmb_tau_grid`,
-:func:`cmb_k_grid`). The characteristic scales come from one trajectory of
-the source kernel itself (:func:`_kernel_thermal_history`), so building them
-compiles nothing new. :func:`cmb_grids` bundles them into :class:`CMBGrids`,
-built once and shared by every batch of an inference loop.
+The sources vary most at recombination and on the sound-horizon scale in
+``tau``, and at the acoustic and Silk damping scales in ``k``.
+:func:`cmb_tau_grid` and :func:`cmb_k_grid` put their points there. One
+trajectory of the source kernel supplies these scales
+(:func:`_kernel_thermal_history`), so building the grids compiles nothing
+new. :func:`cmb_grids` bundles them into :class:`CMBGrids`, which every batch
+of an inference loop can share.
 """
 
 from __future__ import annotations
@@ -22,57 +22,54 @@ from scipy import integrate
 from .sources import solve_sources, visibility_on_grid
 
 SUMMARY_GRID = 2048
-"""Points of the uniform ``log tau`` grid the grid summary reads the opacity on."""
+"""Points of the uniform ``log tau`` grid that the grid summary samples the opacity on."""
 
 DEFAULT_CMB_ELLS = np.unique(
     np.concatenate(
         [np.arange(2, 40, 2), np.arange(40, 200, 5), np.arange(200, 2501, 50)]
     )
 ).astype(np.int64)
-"""Default multipoles at which ``C_l`` is evaluated."""
+"""Default multipoles for ``C_l``."""
 
 
 Z_REION_SEARCH_MAX = 30.0
-"""Redshift below which a reionization visibility bump would be located."""
+"""Redshift below which to look for a reionization bump in the visibility."""
 
 
 TAU_END_MARGIN = 0.01
-"""How far past the fiducial cosmology's ``tau0`` the save grid of :func:`cmb_grids`
-extends, as a fraction, so that the grids built once from a fiducial serve every
-batch whose conformal ages fall within it. Measured against per-batch grids on
-the 128 nearby cosmologies of the tests, the shift onto the fiducial's grid
-moves ``D_l`` by at most 2.7e-4 at 1 percent, 1.0e-3 at 2 percent and 4.4e-3
-at 5 percent (the low multipoles' late-time sources sit on the coarse end of
-the grid)."""
+"""Fraction past the fiducial ``tau0`` where the save grid of :func:`cmb_grids` ends.
+
+Any cosmology with a conformal age inside the margin can use the fiducial
+grids. Against per-batch grids on the tests' 128 cosmologies, the shift moves
+``D_l`` by at most 2.7e-4 at 1 percent, 1.0e-3 at 2 percent and 4.4e-3 at 5
+percent."""
 
 
 def _grhoa4(a, grhog, grhor, grhoc, grhob, grhov):
-    """``8 pi G rho a^4``: the expansion rate is ``a' = sqrt(grhoa4 / 3)``."""
+    """Return ``8 pi G rho a^4``, so that ``a' = sqrt(grhoa4 / 3)``."""
 
     return grhog + grhor + (grhoc + grhob) * a + grhov * a**4
 
 
 def _dtau_da(a, *dens):
-    """``dtau/da = 1 / a'``."""
+    """Return ``dtau/da = 1 / a'``."""
 
     return np.sqrt(3.0 / _grhoa4(a, *dens))
 
 
 SUMMARY_K = 1.0e-3
-"""Wave mode (Mpc^-1) of the one trajectory whose recombination block the grid summary reads."""
+"""Wave mode (Mpc^-1) of the single trajectory the grid summary reads the opacity from."""
 
 
 @functools.lru_cache(maxsize=64)
 def _kernel_thermal_history(cosmology, n_grid: int = SUMMARY_GRID, n_save: int = 1000):
-    """``(tau_grid, a, opacity, tau0)`` of one cosmology on ``n_grid`` uniform ``log tau`` points, from the sources' own solve.
+    """Return ``(tau_grid, a, opacity, tau0)`` on ``n_grid`` uniform ``log tau`` points.
 
-    One trajectory of :func:`~discocmb.sources.solve_sources` (the kernel the spectra use, so
-    nothing more is compiled) records the opacity ``kappa'``, with
-    reionization, from its recombination block's dense output; the scale
-    factor is the background quadrature's. The kernel's save grid has
-    ``n_save`` times, part of its identity, and every launch records the
-    start, ``TAU_START``, so the grid is read in launches of ``n_save - 1``
-    points.
+    One trajectory of :func:`~discocmb.sources.solve_sources` records the
+    opacity ``kappa'``, reionization included. It reuses the spectra's kernel,
+    so nothing new compiles. The scale factor comes from the background
+    quadrature. The kernel's save grid has ``n_save`` times and always starts
+    at ``TAU_START``, so the loop reads ``n_save - 1`` points per launch.
     """
 
     a_bg, tau_bg = eb.background_history(cosmology)
@@ -84,7 +81,7 @@ def _kernel_thermal_history(cosmology, n_grid: int = SUMMARY_GRID, n_save: int =
         times = np.full(n_save, tau_grid[-1])
         times[0] = TAU_START
         times[1 : 1 + len(chunk)] = chunk
-        # equal times past the chunk are not strictly increasing: nudge them
+        # nudge the repeated times past the chunk so they strictly increase
         times[1 + len(chunk) :] += np.arange(1, n_save - len(chunk)) * 1.0e-6
         solution = solve_sources((cosmology,), np.asarray([SUMMARY_K]), times)
         channels = np.asarray(solution.values[0, :, 0, :])  # (6, n_save)
@@ -98,13 +95,12 @@ def _cmb_grid_summary(cosmology) -> dict[str, float]:
 
 @functools.lru_cache(maxsize=4096)
 def _grid_summary(cosmology) -> dict[str, float]:
-    """Return the characteristic scales that set the adaptive ``k`` / ``tau`` grids.
+    """Return the scales that shape the ``k`` and ``tau`` grids.
 
     ``tau_star`` is the visibility peak and ``delta_tau_rec`` its Gaussian
-    equivalent width; ``r_s`` is the sound horizon at recombination (which sets
-    the acoustic oscillation period in ``k``) and ``k_D`` the Silk damping
-    wavenumber (which sets their envelope). Together they say where the CMB
-    sources have structure, and hence where the grids must be dense.
+    width. ``r_s``, the sound horizon at recombination, sets the acoustic
+    period in ``k``, and the Silk damping wavenumber ``k_D`` sets the
+    envelope.
     """
 
     dens = eb.density_coefficients(cosmology)
@@ -144,8 +140,8 @@ def _grid_summary(cosmology) -> dict[str, float]:
     )
     k_D = float(1.0 / np.sqrt(np.trapezoid(integrand_d, a_silk)))
 
-    # The secondary visibility bump from reionization when tau_reio > 0; without
-    # one, the save grid's late-time weight falls back to a broad bump.
+    # Find the reionization bump in the visibility when tau_reio > 0. Without
+    # one, fall back to a broad late-time bump for the save grid's weight.
     post_rec = a_vals > 1.0 / (1.0 + Z_REION_SEARCH_MAX)
     if np.any(post_rec) and np.max(np.where(post_rec, vis, 0.0)) > 1.0e-3 * vis[peak]:
         reion_idx = int(np.argmax(np.where(post_rec, vis, 0.0)))
@@ -189,13 +185,12 @@ def cmb_k_grid(
     n_ell_samples: int = 30,
     n_eval: int = 5000,
 ) -> np.ndarray:
-    """Return a nonuniform wavenumber grid concentrated where the sources vary.
+    """Return a nonuniform wavenumber grid, densest where the sources vary.
 
-    ``mode="ode"`` resolves the acoustic oscillations of the source itself
-    (period set by ``r_s``, envelope by Silk damping ``k_D``) and is the grid the
-    perturbation solve runs on. ``mode="cl"`` additionally weights each ``k`` by
-    how many multipoles project onto it, ``k ~ l / chi_star``, and is the finer
-    grid the ``C_l`` quadrature uses after the sources are interpolated.
+    ``mode="ode"`` resolves the sources' acoustic oscillations (period from
+    ``r_s``, envelope from ``k_D``). The perturbation solve runs on it.
+    ``mode="cl"`` also weights each ``k`` by how many multipoles project onto
+    it, ``k ~ l / chi_star``. The ``C_l`` quadrature uses this finer grid.
     """
 
     cosmology = eb.as_cosmology(cosmology)
@@ -230,17 +225,16 @@ def cmb_k_grid(
 def cmb_tau_grid(
     cosmology, k_values, n: int, *, tau_end: float | None = None, n_eval: int = 10000
 ) -> np.ndarray:
-    """Return a nonuniform conformal-time grid on which to save the sources.
+    """Return a nonuniform conformal-time grid for saving the sources.
 
-    The sources are sharply peaked at recombination (width ``delta_tau_rec``),
-    modulated on the sound-horizon scale, and would have a secondary bump at
-    reionization, so the sampling density is the cube root of the sum of those
-    three weights. Endpoints are pinned to ``[TAU_START, tau_end]``, which the
-    solver's save grid requires.
+    The sources peak sharply at recombination (width ``delta_tau_rec``), vary
+    on the sound-horizon scale and may bump at reionization. The sampling
+    density is the cube root of the sum of those three weights. The grid
+    starts at ``TAU_START`` and ends at ``tau_end``, as the solver requires.
 
-    ``tau_end`` defaults to this cosmology's ``tau0``. A batch of cosmologies
-    passes the *largest* ``tau0`` of the batch so that no trajectory's save grid
-    is cut short; the shaping weights still come from ``cosmology``.
+    ``tau_end`` defaults to this cosmology's ``tau0``. A batch passes its
+    largest ``tau0`` so no trajectory stops early. ``cosmology`` still sets the
+    weights.
     """
 
     k_arr = np.asarray(k_values, dtype=np.float64)
@@ -270,13 +264,13 @@ def cmb_tau_grid(
 
 
 class CMBGrids(NamedTuple):
-    """The grids of one CMB spectrum computation, shaped by a fiducial cosmology.
+    """Grids of one CMB computation, shaped by a fiducial cosmology.
 
-    ``k_values`` are the wave modes the hierarchy is solved on, ``k_fine`` the
-    quadrature grid in ``k`` the sources are refined onto, ``tau_save`` the
-    conformal times the sources are recorded at, ``ells`` the multipoles.
-    Built by :func:`cmb_grids`; passed to :func:`~discocmb.main.compute_cl_power_spectrum_batch`
-    they fix the line-of-sight projection operator across batches.
+    ``k_values`` holds the solved wave modes, ``k_fine`` the quadrature grid
+    the sources get refined onto, ``tau_save`` the save times and ``ells`` the
+    multipoles. :func:`cmb_grids` builds them. Passing them to
+    :func:`~discocmb.main.compute_cl_power_spectrum_batch` keeps one
+    projection operator across batches.
     """
 
     k_values: np.ndarray
@@ -300,26 +294,19 @@ def cmb_grids(
     tau_end: float | None = None,
     tau_end_margin: float = TAU_END_MARGIN,
 ) -> CMBGrids:
-    """Return the :class:`CMBGrids` shaped by ``cosmology``, built once for many batches.
+    """Return :class:`CMBGrids` shaped by ``cosmology``, to reuse across batches.
 
-    The grids adapt to where the sources have structure -- the recombination
-    epoch and the sound horizon in ``tau`` (:func:`cmb_tau_grid`), the acoustic
-    scale and Silk damping in ``k`` (:func:`cmb_k_grid`) -- and nearby
-    cosmologies share that structure, so one fiducial's grids serve them all;
-    a batch has always been solved on its first cosmology's grids. Fixing them
-    across batches is what lets the projection operator
-    (:func:`~discocmb.transfer.projection_operator`: the Bessel table and the ``ln k`` refinement
-    matrix) be built once rather than per batch, 0.3 s each time.
+    Nearby cosmologies share where their sources vary, so one fiducial's grids
+    serve them all. Fixed grids let
+    :func:`~discocmb.transfer.projection_operator` build the Bessel table and
+    ``ln k`` refinement matrix once instead of spending 0.3 s per batch.
 
     The save grid ends at ``tau_end``, by default ``tau_end_margin`` past the
-    fiducial's ``tau0``, and every cosmology projected on these grids must
-    have ``tau0 <= tau_end`` (its sources are shifted onto the shared
-    comoving-distance grid, which must reach ``tau0``). A cosmology's own
-    trajectory still stops at its own ``tau0``; the saves past it carry zero
-    sources. The shift grows with the margin and costs accuracy through the
-    source interpolation (see :data:`TAU_END_MARGIN` for the measured cost),
-    so keep the margin to what the batches need. A cosmology past ``tau_end``
-    raises ``ValueError`` rather than projecting short.
+    fiducial's ``tau0``. Every cosmology needs ``tau0 <= tau_end``, otherwise
+    :func:`~discocmb.main.compute_transfer_batch` raises ``ValueError``. Its
+    saves past its own ``tau0`` carry zero sources. A larger margin costs
+    accuracy (see :data:`TAU_END_MARGIN`), so keep it as small as the batches
+    allow.
     """
 
     cosmology = eb.as_cosmology(cosmology)

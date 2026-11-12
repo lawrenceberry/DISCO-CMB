@@ -1,14 +1,14 @@
-"""The unlensed CMB power spectra from the transfer functions.
+"""Unlensed CMB power spectra from the transfer functions.
 
-The angular power spectra follow from the transfer functions of
-:mod:`discocmb.transfer` and the primordial curvature spectrum,
+The transfer functions of :mod:`discocmb.transfer` and the primordial
+curvature spectrum give
 
     ``C_l^{XY} = 4 pi int dln k  P_R(k) X_l(k) Y_l(k)``,   ``P_R = A_s (k/k_p)^{n_s - 1}``
 
-with ``X, Y`` the temperature ``Theta_l`` or the E-mode ``E_l``, and are
-reported as ``D_l = l(l+1) C_l / 2pi`` in ``muK^2`` (:func:`dl_power_spectrum`).
-The three spectra are returned together as a :class:`Spectra` (``tt, te,
-ee``); the lensed TE, EE and BB follow in :mod:`discocmb.lensing`.
+where ``X`` and ``Y`` stand for the temperature ``Theta_l`` or the E-mode
+``E_l``. :func:`dl_power_spectrum` converts to ``D_l = l(l+1) C_l / 2pi`` in
+``muK^2``. A :class:`Spectra` holds the three spectra (``tt, te, ee``).
+:mod:`discocmb.lensing` computes the lensed ones.
 """
 
 from __future__ import annotations
@@ -23,11 +23,12 @@ from .transfer import TransferBatch, TransferGrids, primordial_spectrum
 
 
 class Spectra(NamedTuple):
-    """The scalar CMB spectra of one computation: temperature, cross and E-mode.
+    """Temperature, cross and E-mode spectra.
 
-    Each field is an array over the multipoles (with a leading batch axis from
-    :func:`~discocmb.main.compute_cl_power_spectrum_batch`); as a tuple it stacks and maps like
-    one, ``jnp.stack(spectra)`` giving ``(3, ...)`` in the order ``tt, te, ee``.
+    Each field is an array over the multipoles, with a leading batch axis when
+    it comes from :func:`~discocmb.main.compute_cl_power_spectrum_batch`. It
+    behaves like any tuple, so ``jnp.stack(spectra)`` gives ``(3, ...)`` in the
+    order ``tt, te, ee``.
     """
 
     tt: jax.Array
@@ -37,9 +38,10 @@ class Spectra(NamedTuple):
 
 @jax.jit
 def cl_from_theta(theta, lnk_weights, n_s, A_s, k_pivot, k_fine, theta2=None):
-    """``C_l = 4 pi int dln k P_R(k) Theta_l(k) Theta2_l(k)`` for transfer functions of shape ``(n_c, n_ell, n_k_fine)``.
+    """Return ``C_l = 4 pi int dln k P_R(k) Theta_l(k) Theta2_l(k)``.
 
-    The auto spectrum of ``theta`` by default; the cross spectrum with ``theta2``.
+    ``theta`` is ``(n_c, n_ell, n_k_fine)``. Without ``theta2`` this gives the
+    auto spectrum of ``theta``, with it the cross spectrum.
     """
 
     primordial = primordial_spectrum(k_fine, n_s, A_s, k_pivot)
@@ -50,7 +52,7 @@ def cl_from_theta(theta, lnk_weights, n_s, A_s, k_pivot, k_fine, theta2=None):
 def spectra_from_theta(
     theta, theta_e, lnk_weights, n_s, A_s, k_pivot, k_fine
 ) -> Spectra:
-    """The ``(tt, te, ee)`` :class:`Spectra` of the two transfer functions of :func:`~discocmb.transfer.theta_ell_batch`."""
+    """Return the :class:`Spectra` of the transfer functions from :func:`~discocmb.transfer.theta_ell_batch`."""
 
     args = (lnk_weights, n_s, A_s, k_pivot, k_fine)
     return Spectra(
@@ -69,7 +71,10 @@ def dl_power_spectrum(cl, ells, T_cmb):
 
 @jax.jit
 def spectra_from_transfer(transfer: TransferBatch, tgrids: TransferGrids, n_s, A_s):
-    """``(C_l, D_l, C_l^{psi psi} or None)`` of a :class:`~discocmb.transfer.TransferBatch` for primordial spectra ``A_s (k / k_pivot)^(n_s - 1)``, ``(n_c,)`` each."""
+    """Return ``(C_l, D_l, C_l^{psi psi} or None)`` of a :class:`~discocmb.transfer.TransferBatch`.
+
+    ``n_s`` and ``A_s`` are ``(n_c,)`` and set ``P_R = A_s (k / k_pivot)^(n_s - 1)``.
+    """
 
     cl = spectra_from_theta(
         transfer.theta,

@@ -1,17 +1,17 @@
 """DISCO-CMB: CMB angular power spectra from DISCO-EB's Einstein-Boltzmann solve.
 
-The computation runs in four steps, one module each, brought together by
-:mod:`discocmb.main`:
+The computation has four steps, one module each, and :mod:`discocmb.main`
+chains them:
 
-1. :mod:`discocmb.sources` -- the line-of-sight source functions, a component
-   DISCO-EB's kernel evaluates at every save time;
-2. :mod:`discocmb.transfer` -- line-of-sight integration into the temperature
-   and E-mode transfer functions;
-3. :mod:`discocmb.spectra` -- the unlensed TT, TE and EE power spectra;
-4. :mod:`discocmb.lensing` -- the lensing potential and the lensed spectra.
+1. :mod:`discocmb.sources`: the line-of-sight sources, which DISCO-EB's
+   kernel evaluates at every save time.
+2. :mod:`discocmb.transfer`: line-of-sight integration into the temperature
+   and E-mode transfer functions.
+3. :mod:`discocmb.spectra`: the unlensed TT, TE and EE spectra.
+4. :mod:`discocmb.lensing`: the lensing potential and the lensed spectra.
 
-:mod:`discocmb.grids` builds the grids every step shares. DISCO-EB is called
-through its interface :mod:`discoeb` only.
+:mod:`discocmb.grids` builds the grids the steps share. The package talks to
+DISCO-EB only through :mod:`discoeb`.
 """
 
 from .grids import CMBGrids, cmb_grids, cmb_k_grid

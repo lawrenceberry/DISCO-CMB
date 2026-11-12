@@ -1,23 +1,19 @@
 """CMB power spectra end to end, for batches of cosmologies.
 
-The pipeline, each step in its own module:
-
 1. **Sources** (:mod:`discocmb.sources`): one DISCO-EB launch
-   (:func:`~discoeb.solve_eb`, through :func:`~discocmb.sources.solve_sources`)
-   integrates the perturbation hierarchy of every wave mode of every
-   cosmology with the :class:`~discocmb.sources.LineOfSightSources` component
-   appended, keeping the source channels at every save time; they are then
-   weighted by the visibility on the device.
-2. **Line-of-sight integration** (:mod:`discocmb.transfer`): the sources are
-   shifted onto a shared ``chi`` grid, refined in ``ln k`` and projected
-   against the Bessel tables into ``Theta_l(k)`` and ``E_l(k)``.
-3. **Power spectra** (:mod:`discocmb.spectra`): ``C_l`` and ``D_l`` of TT, TE
-   and EE from the transfer functions and the primordial spectrum.
+   (:func:`~discocmb.sources.solve_sources`) integrates every wave mode of
+   every cosmology and keeps the source channels at each save time. The
+   device then applies the visibility weighting.
+2. **Line-of-sight integration** (:mod:`discocmb.transfer`): shift the
+   sources onto a shared ``chi`` grid, refine them in ``ln k`` and project
+   them against Bessel tables into ``Theta_l(k)`` and ``E_l(k)``.
+3. **Power spectra** (:mod:`discocmb.spectra`): TT, TE and EE ``C_l`` and
+   ``D_l`` from the transfer functions and the primordial spectrum.
 4. **Lensing** (:mod:`discocmb.lensing`): on request, ``C_l^{psi psi}`` from
-   the saved Weyl potential; :func:`discocmb.lensing.lensed_spectra` then
+   the saved Weyl potential. :func:`discocmb.lensing.lensed_spectra` then
    lenses the spectra.
 
-The grids of every step come from :mod:`discocmb.grids`.
+:mod:`discocmb.grids` supplies the grids.
 """
 
 from __future__ import annotations
@@ -54,10 +50,10 @@ def compute_transfer_batch(
     lensing_potential_ells: np.ndarray | None = None,
     **solve_kwargs,
 ):
-    """Return ``(TransferBatch, TransferGrids)`` for a batch of cosmologies: the spectra before the primordial spectrum.
+    """Return ``(TransferBatch, TransferGrids)``: everything before ``P_R(k)``.
 
-    The first half of :func:`compute_cl_power_spectrum_batch`, which is this
-    followed by :func:`~discocmb.spectra.spectra_from_transfer`; see it for the arguments.
+    :func:`compute_cl_power_spectrum_batch` calls this and then
+    :func:`~discocmb.spectra.spectra_from_transfer`. See it for the arguments.
     """
 
     cosmologies = tuple(eb.as_cosmology(c) for c in cosmologies)
@@ -81,8 +77,8 @@ def compute_transfer_batch(
         )
 
     # 1. Sources: one DISCO-EB launch keeps the source channels at every save.
-    # The kept sources are part of the kernel-cache key; like the right-hand
-    # side they are compiled once per layout, and nothing per batch is uploaded.
+    # The kept names join the kernel-cache key, so like the right-hand side
+    # they compile once per layout and no batch uploads anything extra.
     k_sorted = np.sort(np.asarray(k_values, dtype=np.float64))
     solution = solve_sources(cosmologies, k_sorted, tau_save, **solve_kwargs)
     # (n_cosmo, 6, n_k, n_tau), then the visibility weighting
@@ -98,11 +94,10 @@ def compute_transfer_batch(
     ells_d = jnp.asarray(ells, dtype=jnp.float64)
     k_fine_d = jnp.asarray(k_fine)
     tau_d = jnp.asarray(tau_save)
-    # Everything per cosmology below is one host array and one device transfer
-    # for the whole batch: the shifts onto the shared chi grid, the k bands, the
-    # primordial amplitudes. A per-cosmology loop of eager ``jnp`` arithmetic
-    # here cost 80 ms of host time a batch (and, while the kernel was in
-    # flight, waited for it).
+    # Build the per-cosmology arrays (chi shifts, k bands, primordial
+    # amplitudes) as one host array and one device transfer for the batch.
+    # An eager per-cosmology ``jnp`` loop here cost 80 ms of host time a batch
+    # and stalled on the running kernel.
     chi_max = float(tau0_ref - tau_save[0])
     shift_idx, shift_w = lagrange_shift_stencil(tau_save, tau0_all - tau0_ref)
     shift_idx, shift_w = jnp.asarray(shift_idx), jnp.asarray(shift_w)
@@ -110,10 +105,10 @@ def compute_transfer_batch(
     T_cmb = jnp.asarray([float(c.T_cmb) for c in cosmologies])
     k_pivot = float(cosmologies[0].k_pivot)
 
-    # The whole batch is one call, chunked over the fine wave modes so the
-    # Bessel table is read once and a chunk's sources fit the memory budget;
-    # chunking over cosmologies instead read the table once per group (60 ms
-    # a batch of 128 against 37).
+    # One call for the whole batch, chunked over fine wave modes. That reads
+    # the Bessel table once and keeps each chunk within the memory budget.
+    # Chunking over cosmologies read the table once per group (60 ms for a
+    # batch of 128 against 37).
     theta, theta_e = theta_ell_batch(
         channels,
         tau_d,
@@ -132,7 +127,7 @@ def compute_transfer_batch(
         tgrids = TransferGrids(ells, k_fine_d, lnk_weights, k_pivot, None, None, None)
         return transfer, tgrids
 
-    # 4. The lensing potential's transfer, from the saved Weyl potential.
+    # 4. Lensing potential transfer from the saved Weyl potential.
     ells_pp = np.asarray(lensing_potential_ells, dtype=np.int64)
     operator, limber_weights, k_chi = lensing_operators(
         ells_pp, k_sorted, tau_save, tau0_ref, projection_dtype
@@ -167,36 +162,30 @@ def compute_cl_power_spectrum_batch(
     lensing_potential_ells: np.ndarray | None = None,
     **solve_kwargs,
 ):
-    """Return ``(ells, C_l, D_l)`` for a batch of cosmologies, each a :class:`~discocmb.spectra.Spectra` of ``(N, n_ell)``.
+    """Return ``(ells, C_l, D_l)`` for a batch, each a :class:`~discocmb.spectra.Spectra` of ``(N, n_ell)``.
 
-    ``C_l`` holds the unlensed scalar ``tt``, ``te`` and ``ee`` spectra
-    (dimensionless, relative to ``T_cmb``) and ``D_l = l(l+1) C_l / 2pi`` the
-    same in ``muK^2``. With ``lensing_potential_ells`` the lensing potential
-    spectrum ``C_l^{psi psi}`` at those multipoles (:mod:`discocmb.lensing`) is
-    returned as a fourth element, ``(N, n_ell_psi)``, from the Weyl potential
-    the same launch recorded; :func:`discocmb.lensing.lensed_spectra` turns the
-    two into the lensed TT, TE, EE and BB.
+    ``C_l`` holds the unlensed ``tt``, ``te`` and ``ee`` spectra in units of
+    ``T_cmb^2``, and ``D_l = l(l+1) C_l / 2pi`` the same in ``muK^2``. Pass
+    ``lensing_potential_ells`` to get ``C_l^{psi psi}`` at those multipoles as
+    a fourth element, ``(N, n_ell_psi)``.
+    :func:`discocmb.lensing.lensed_spectra` turns the two into lensed TT, TE,
+    EE and BB.
 
+    One modax launch solves every wave mode of every cosmology and returns six
+    numbers per save and trajectory, with no history, so only the kernel's own
+    memory limits the batch size.
 
-    One modax launch integrates the perturbation hierarchy of every wave mode of
-    every cosmology, with the sources evaluated at the save times by the save
-    hook; the launch returns ``5 n_save`` numbers per trajectory and no history,
-    so nothing bounds the batch but the kernel's own memory. The sources are
-    then refined in ``ln k`` onto the fine grid and projected by
-    :func:`~discocmb.transfer.theta_ell_batch` and :func:`~discocmb.spectra.spectra_from_theta`.
+    ``grids`` (from :func:`~discocmb.grids.cmb_grids`) fixes the wave modes,
+    multipoles, fine ``k`` grid and save grid. Build it once from a fiducial
+    cosmology and every batch reuses the projection operator. Without it the
+    batch's first cosmology shapes the grids from the other keyword
+    arguments, the save grid ends at the batch's largest ``tau0``, and the
+    operator gets rebuilt whenever the grids change.
 
-    ``grids`` fixes the wave modes, multipoles, fine ``k`` grid and save grid
-    (:func:`~discocmb.grids.cmb_grids`); built once from a fiducial cosmology, it makes the
-    projection operator shared by every batch of an inference loop. Without
-    it, the grids are shaped by the batch's first cosmology from the remaining
-    keyword arguments, with the save grid ending at the largest ``tau0`` of the
-    batch (each cosmology's own ``tau0`` is respected through zeroed sources
-    past it), and the operator is rebuilt for each batch whose grids differ.
-
-    ``projection_dtype`` is the arithmetic of the projection's matrix products:
-    ``float32`` (default, 2.6e-4 in ``D_l``) or ``float64`` (ten times slower
-    on consumer GPUs). ``solve_kwargs`` reach the solver (``rtol``, ``atol``,
-    ``first_step``, ``max_steps``).
+    ``projection_dtype`` sets the precision of the projection's matrix
+    products: ``float32`` (default, 2.6e-4 in ``D_l``) or ``float64`` (ten
+    times slower on consumer GPUs). ``solve_kwargs`` go to the solver
+    (``rtol``, ``atol``, ``first_step``, ``max_steps``).
     """
 
     cosmologies = tuple(eb.as_cosmology(c) for c in cosmologies)
@@ -235,26 +224,25 @@ def cl_power_spectrum_jax(
     projection_dtype=jnp.float64,
     **solve_kwargs,
 ):
-    """``(ells, C_l, D_l)`` of one cosmology as JAX arrays, differentiable in the cosmology.
+    """Return ``(ells, C_l, D_l)`` of one cosmology, differentiable in its inputs.
 
-    The counterpart of :func:`discoeb.perturbations.matter_power_spectrum_jax`
-    for the unlensed spectra (a :class:`~discocmb.spectra.Spectra` each, ``tt, te, ee`` of
-    shape ``(n_ell,)``). ``densities`` (the five background densities
-    ``grhog, grhornomass, grhoc, grhob, grhov``) and ``thermal`` (``YHe,
-    Tcmb, H0, Omegab``) -- together the Einstein-Boltzmann part's directed
-    inputs (:data:`discoeb.DIRECTED_NAMES`) -- default to the cosmology's
-    own; given as JAX values, the spectra are differentiable in them. The
-    derivative is formed in the kernel: :func:`~discocmb.sources.solve_sources` keeps the
-    sources and, for a tangent, their derivatives along each input, by the
-    forward sensitivities of both blocks of the hierarchy, so the
-    recombination history is differentiated along with the hierarchy and the
-    densities enter again through the source algebra; no history is stored.
-    The grids, the save grid, ``tau0`` and the reionization redshift are held
-    fixed. It is :func:`compute_transfer_batch` and
-    :func:`~discocmb.spectra.spectra_from_transfer` for a batch of one. The solve uses :func:`~discocmb.sources.polarization_error_weights` unless
-    ``error_weights`` is given. The projection defaults to ``float64``: the
-    ``float32`` matrix products cost 2.6e-4 in ``D_l``, which a derivative of
-    the spectrum cannot afford.
+    ``C_l`` and ``D_l`` are :class:`~discocmb.spectra.Spectra` of shape
+    ``(n_ell,)``. ``densities`` (``grhog, grhornomass, grhoc, grhob, grhov``)
+    and ``thermal`` (``YHe, Tcmb, H0, Omegab``) make up DISCO-EB's directed
+    inputs (:data:`discoeb.DIRECTED_NAMES`) and default to the cosmology's
+    own. Pass them as JAX values to differentiate the spectra with respect to
+    them.
+
+    The kernel forms the derivative itself. It carries forward sensitivities
+    through the hierarchy and the recombination history, and the source
+    algebra sees the densities again, so nothing stores a history. The grids,
+    ``tau0`` and the reionization redshift stay fixed.
+
+    This runs :func:`compute_transfer_batch` and
+    :func:`~discocmb.spectra.spectra_from_transfer` on a batch of one. The
+    solve uses :func:`~discocmb.sources.polarization_error_weights` unless you
+    pass ``error_weights``. The projection defaults to ``float64`` because
+    ``float32`` costs 2.6e-4 in ``D_l``, too much for a derivative.
     """
 
     cosmology = eb.as_cosmology(cosmology)

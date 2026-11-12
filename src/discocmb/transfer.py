@@ -1,38 +1,30 @@
-"""Line-of-sight integration: the temperature and E-mode transfer functions.
+"""Line-of-sight integration into temperature and E-mode transfer functions.
 
-Rather than following the photon multipole hierarchy up to ``l ~ 2500``, the
-temperature transfer function is a single integral of the source functions
-(:mod:`discocmb.sources`) against spherical Bessel functions,
+Instead of following the photon hierarchy to ``l ~ 2500``, one integral of the
+sources (:mod:`discocmb.sources`) against spherical Bessel functions gives the
+temperature transfer function,
 
     ``Theta_l(k) = int_0^{tau_0} dtau [S j_l(x) + S_j1 j_l'(x) + S_j2 j_l''(x)]``
 
-with ``x = k (tau_0 - tau)``. The E-mode transfer function is the
-quadrupole/polarization term against ``j_l(x) / x^2``,
+with ``x = k (tau_0 - tau)``. The E-mode transfer function integrates the
+quadrupole term against ``j_l(x) / x^2``,
 
     ``E_l(k) = sqrt((l+2)!/(l-2)!) int_0^{tau_0} dtau S_j2 j_l(x) / x^2``
 
-(Zaldarriaga & Seljak 1997; CAMB's ``sources(2)``), so the projection carries
-a fourth Bessel row, ``j_l(x) / x^2`` with the ``l``-dependent prefactor folded
-in, tabulated directly (not divided after interpolation, since ``j_l`` is
-interpolated linearly and ``j_2(x) / x^2 -> 1/15`` at the end of the line of
-sight, where a reionized universe still has visibility).
+(Zaldarriaga & Seljak 1997, CAMB's ``sources(2)``). The projection tabulates
+``j_l(x) / x^2`` directly as a fourth Bessel row. Dividing after linear
+interpolation would fail near ``x = 0``, where ``j_2(x) / x^2 -> 1/15`` and a
+reionized universe still has visibility.
 
-**How the line of sight is projected.** As matrix products on grids shared by
-the whole batch (:func:`projection_operator`, :func:`theta_ell_batch`). The
-sources of every cosmology are shifted in ``tau`` onto one comoving-distance
-grid ``chi = tau0_ref - tau`` (a 4-point Lagrange stencil; each cosmology's own
-``tau0`` differs from the reference by up to ~100 Mpc), spline-interpolated in
-``ln k`` from the solved modes to the fine quadrature grid by a precomputed
-matrix, and contracted against one weighted table of ``j_l``, ``j_l'`` and
-``j_l''`` on the ``(k, chi)`` grid -- a batched GEMM over cosmologies. Against a
-per-cosmology projection with exact ``chi`` this costs 2e-4 in ``D_l``, and the
-default ``float32`` arithmetic another 2.6e-4, both below the pipeline's other
-numerical differences; it runs in 0.25 ms per cosmology (2.3 ms in ``float64``)
-where the per-cosmology spline and Bessel evaluation took 13 ms. An FFTLog
-projection was tried and rejected: it must resample the sources onto a
-log-spaced ``chi`` grid that is coarsest at recombination, needs 32768 points to
-match, and even then costs an order of magnitude more than the table
-contraction, whose flop count is a few percent of the FFT's.
+**Projection.** :func:`projection_operator` and :func:`theta_ell_batch` work
+as matrix products on grids the batch shares. A 4-point Lagrange stencil
+shifts each cosmology's sources onto one grid ``chi = tau0_ref - tau``, a
+precomputed spline matrix refines them in ``ln k``, and a batched GEMM
+contracts them against one weighted table of ``j_l``, ``j_l'`` and ``j_l''``.
+The shared ``chi`` grid costs 2e-4 in ``D_l`` and ``float32`` another 2.6e-4.
+It takes 0.25 ms per cosmology (2.3 ms in ``float64``), against 13 ms for a
+per-cosmology spline and Bessel evaluation. FFTLog lost: it needs 32768
+log-spaced points to resolve recombination and costs ten times more.
 """
 
 from __future__ import annotations
@@ -52,23 +44,24 @@ from scipy import special
 from .sources import assemble_sources
 
 CACHE_SIZE = 8
-"""Batches of grids whose projection operators and lensing tables are kept."""
+"""Number of grid sets whose projection operators and lensing tables stay cached."""
 
 
 SHIFT_STENCIL = 4
-"""Points of the Lagrange stencil that shifts a cosmology's sources in ``tau`` onto
-the shared ``chi`` grid: 4 (cubic) leaves 2e-4 in ``D_l``, 2 (linear) 7e-3."""
+"""Points of the Lagrange stencil that shifts sources onto the shared ``chi`` grid.
+
+4 (cubic) leaves 2e-4 in ``D_l``, 2 (linear) 7e-3."""
 
 PROJECTION_BUDGET_BYTES = 1.0e9
-"""Device memory for one projection chunk's fine-``k`` source arrays, which sets how
-many fine wave modes are contracted together at once."""
+"""Device memory for one projection chunk's fine-``k`` sources. It sets how many
+fine wave modes each chunk contracts."""
 
 
 def array_cache(function):
-    """:func:`functools.lru_cache` of :data:`CACHE_SIZE` for a function of NumPy arrays.
+    """Wrap ``function`` in a :func:`functools.lru_cache` of :data:`CACHE_SIZE` that accepts NumPy arrays.
 
-    Array arguments are keyed by dtype, shape and contents and handed to
-    ``function`` as read-only copies; other arguments must be hashable.
+    The key uses each array's dtype, shape and contents, and ``function``
+    receives read-only copies. Other arguments must be hashable.
     """
 
     def key(value):
@@ -94,9 +87,9 @@ def array_cache(function):
 
 
 def trapezoid_weights(x, xp=np):
-    """Weights ``w`` of the trapezoid rule on the samples ``x``: ``int f ~ sum_j w_j f(x_j)``.
+    """Return trapezoid weights ``w`` on ``x``, so that ``int f ~ sum_j w_j f(x_j)``.
 
-    ``xp`` is ``np`` on the host or ``jnp`` under ``jit``. The weights are
+    ``xp`` is ``np`` on the host or ``jnp`` under ``jit``. The weights stay
     positive whichever way ``x`` runs.
     """
 
@@ -105,9 +98,9 @@ def trapezoid_weights(x, xp=np):
 
 
 def primordial_spectrum(k, n_s, A_s, k_pivot):
-    """``P_R(k) = A_s (k / k_pivot)^(n_s - 1)`` of a batch, shape ``(n_c, *k.shape)``.
+    """Return ``P_R(k) = A_s (k / k_pivot)^(n_s - 1)`` of shape ``(n_c, *k.shape)``.
 
-    ``n_s`` and ``A_s`` are ``(n_c,)``; ``k`` is any array of wave numbers.
+    ``n_s`` and ``A_s`` are ``(n_c,)``, and ``k`` can have any shape.
     """
 
     batch = (slice(None),) + (None,) * jnp.ndim(k)
@@ -118,7 +111,7 @@ def _bessel_row(ell: int, n_x: int, dx: float) -> np.ndarray:
     """Return ``j_ell`` sampled on the uniform grid ``x = 0, dx, ..., dx (n_x-1)``.
 
     ``j_ell(x)`` is exponentially small below its turning point ``x ~ ell``, so
-    the row is left at zero until ``ell - 4 ell^{1/3}``.
+    the row stays zero up to ``ell - 4 ell^{1/3}``.
     """
 
     x = np.linspace(0.0, dx * (n_x - 1), n_x)
@@ -135,13 +128,13 @@ def _bessel_row(ell: int, n_x: int, dx: float) -> np.ndarray:
 
 @array_cache
 def _bessel_tables(ell_arr, x_max, dx):
-    """Uniform ``j_ell``, ``j_{ell+1}`` and ``j_ell / x^2`` interpolation tables to ``x_max``."""
+    """Return uniform tables of ``j_ell``, ``j_{ell+1}`` and ``j_ell / x^2`` up to ``x_max``."""
 
     n_x = int(np.ceil(x_max / dx)) + 2
     unique = [int(ell) for ell in np.unique(np.concatenate([ell_arr, ell_arr + 1]))]
-    # Each row is a few hundred thousand evaluations of scipy's j_nu, which
-    # releases the GIL: the rows are computed on every core (85 s on one).
-    # j_l / x^2 is the same row divided through, so it is not recomputed.
+    # Each row takes a few hundred thousand calls to scipy's j_nu, which
+    # releases the GIL, so compute the rows on every core (85 s on one).
+    # j_l / x^2 reuses the j_l row.
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
         rows = dict(
             zip(unique, pool.map(lambda ell: _bessel_row(ell, n_x, dx), unique))
@@ -158,11 +151,10 @@ def _bessel_tables(ell_arr, x_max, dx):
 
 
 def _over_x2(row: np.ndarray, ell: int, n_x: int, dx: float) -> np.ndarray:
-    """``j_ell(x) / x^2`` from the ``j_ell`` row: the E-mode kernel.
+    """Return the E-mode kernel ``j_ell(x) / x^2`` from the ``j_ell`` row.
 
-    Smooth through ``x = 0`` (``1/15`` there for ``ell = 2``, zero above), so
-    it interpolates accurately where ``j_ell`` itself, divided afterwards,
-    would not.
+    It is smooth through ``x = 0`` (``1/15`` for ``ell = 2``, zero above), so
+    it interpolates well where dividing ``j_ell`` afterwards would not.
     """
 
     x = np.linspace(0.0, dx * (n_x - 1), n_x)
@@ -173,9 +165,9 @@ def _over_x2(row: np.ndarray, ell: int, n_x: int, dx: float) -> np.ndarray:
 
 
 def _uniform_stencil(x, inv_dx, n_x):
-    """``(idx, frac)`` that interpolate a table sampled uniformly from ``x = 0`` linearly at ``x``.
+    """Return ``(idx, frac)`` for linear interpolation at ``x`` in a table that starts at ``x = 0``.
 
-    Shared by every table on the same ``x``: ``(1 - frac) vals[idx] + frac vals[idx + 1]``.
+    Every table on the same ``x`` can reuse them: ``(1 - frac) vals[idx] + frac vals[idx + 1]``.
     """
 
     u = x * inv_dx
@@ -188,15 +180,13 @@ def k_band(ells, k, chi_max, chi_star):
     """Return the ``(n_ell, n_k)`` mask of wave modes that project onto each multipole.
 
     ``j_l(x)`` is exponentially small below its turning point, so modes with
-    ``k chi_max < l - 4 l^{1/3}`` contribute nothing; and modes far above
-    ``k ~ l / chi_star`` only contribute through rapidly oscillating tails that
-    the finite ``tau`` and ``k`` grids cannot resolve, so integrating them
-    injects aliasing noise rather than signal. Without the upper cut the damping
-    tail is inflated by several percent (``+6%`` at ``l = 500``).
+    ``k chi_max < l - 4 l^{1/3}`` add nothing. Modes far above ``k ~ l /
+    chi_star`` add only fast-oscillating tails that the grids cannot resolve,
+    which means aliasing noise. Without the upper cut the damping tail comes
+    out several percent high (6 percent at ``l = 500``).
 
-    ``chi_star`` may carry leading batch axes, ``(n_c,)`` for a batch of
-    cosmologies, and the mask then has them too: ``(n_c, n_ell, n_k)``, from
-    one jitted call rather than one eager call per cosmology.
+    With a batch of ``chi_star``, ``(n_c,)``, the mask becomes ``(n_c, n_ell,
+    n_k)``.
     """
 
     ells = ells[:, None]
@@ -207,13 +197,12 @@ def k_band(ells, k, chi_max, chi_star):
 
 
 def lagrange_shift_stencil(tau, delta, order=SHIFT_STENCIL):
-    """Interpolate a ``tau``-sampled function at ``tau + delta``: stencil start indices and weights.
+    """Return the stencil ``(i0, w)`` that evaluates a ``tau``-sampled function at ``tau + delta``.
 
-    Returns ``(i0, w)`` with ``i0`` of shape ``(n_tau,)`` and ``w`` of shape
-    ``(n_tau, order)`` such that ``f(tau_j + delta) ~ sum_a w[j, a] f(tau[i0_j + a])``.
-    Targets outside the grid are clamped to its ends. ``delta`` may carry
-    leading axes, ``(n_c,)`` for one shift per cosmology of a batch, which
-    then lead the shapes of ``i0`` and ``w``.
+    ``i0`` is ``(n_tau,)`` and ``w`` is ``(n_tau, order)``, with
+    ``f(tau_j + delta) ~ sum_a w[j, a] f(tau[i0_j + a])``. Targets outside the
+    grid clamp to its ends. A ``delta`` of shape ``(n_c,)``, one shift per
+    cosmology, adds that leading axis to ``i0`` and ``w``.
     """
 
     tau = np.asarray(tau, dtype=np.float64)
@@ -231,9 +220,9 @@ def lagrange_shift_stencil(tau, delta, order=SHIFT_STENCIL):
 
 
 def shift_onto_chi(x, shift_idx, shift_w):
-    """``x`` of a batch, ``(n_c, ..., n_tau)``, shifted onto the shared ``chi`` grid along its last axis.
+    """Shift ``x``, ``(n_c, ..., n_tau)``, onto the shared ``chi`` grid along its last axis.
 
-    ``shift_idx`` ``(n_c, n_tau)`` and ``shift_w`` ``(n_c, n_tau, order)`` are
+    ``shift_idx`` ``(n_c, n_tau)`` and ``shift_w`` ``(n_c, n_tau, order)`` hold
     each cosmology's stencil from :func:`lagrange_shift_stencil`.
     """
 
@@ -246,7 +235,7 @@ def shift_onto_chi(x, shift_idx, shift_w):
 
 
 class ProjectionOperator(NamedTuple):
-    """The shared factors of the line-of-sight projection, from :func:`projection_operator`."""
+    """Shared factors of the line-of-sight projection, from :func:`projection_operator`."""
 
     interp: jax.Array
     bessel: jax.Array
@@ -255,22 +244,23 @@ class ProjectionOperator(NamedTuple):
 
 
 def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.float32):
-    """Return the shared factors of the line-of-sight projection, cached per grids.
+    """Return the shared factors of the line-of-sight projection, cached per grid set.
 
-    ``interp`` is the ``(n_k_fine, n_k)`` natural-cubic-spline matrix in ``ln k``
-    (the spline applied to the identity, so it reproduces
-    :class:`~discoeb.spline_interpolation.spline_interpolation` to rounding);
-    ``bessel`` is the ``(n_k_fine, n_ell, 3, n_chi)`` table of ``j_l``, ``j_l'``
-    and ``j_l''`` at ``x = k chi`` on the shared grid ``chi = tau0_ref - tau_save``
-    with the trapezoid weights of the ``tau`` integral folded in, so that
+    ``interp``: the ``(n_k_fine, n_k)`` natural cubic spline matrix in
+    ``ln k``, the spline of the identity.
+
+    ``bessel``: the ``(n_k_fine, n_ell, 3, n_chi)`` table of ``j_l``,
+    ``j_l'`` and ``j_l''`` at ``x = k chi``, with ``chi = tau0_ref -
+    tau_save`` and the trapezoid weights of the ``tau`` integral folded in.
+    For the three shifted, refined source channels ``A``,
 
         ``Theta_l(k) = sum_s sum_j A[s, k, j] bessel[k, l, s, j]``
 
-    for the three shifted, refined source channels ``A``; ``bessel_e`` is the
-    ``(n_k_fine, n_ell, n_chi)`` table of the E-mode kernel
-    ``sqrt((l+2)!/(l-2)!) j_l(x) / x^2`` with the same weights, contracted
-    against the third channel alone; ``lnk_weights`` are the trapezoid weights
-    of the ``C_l`` quadrature in ``ln k``.
+    ``bessel_e``: the ``(n_k_fine, n_ell, n_chi)`` table of
+    ``sqrt((l+2)!/(l-2)!) j_l(x) / x^2`` with the same weights, for the third
+    channel only.
+
+    ``lnk_weights``: trapezoid weights of the ``C_l`` quadrature in ``ln k``.
     """
 
     return _projection_operator(
@@ -291,13 +281,13 @@ def _projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype):
 
     chi = tau0_ref - tau_save
     x = jnp.asarray(k_fine)[:, None] * jnp.asarray(chi)[None, :]
-    # x_max rounded up so that nearby grids share one table
+    # round x_max up so nearby grids share one table
     x_max = float(np.max(k_fine) * np.max(chi)) + 2.0
     inv_dx, n_x, jl_tab, jl1_tab, jlx2_tab = _bessel_tables(
         ells, float(np.ceil(x_max / 250.0) * 250.0), 0.03
     )
     weights = jnp.asarray(trapezoid_weights(tau_save))
-    # x is the same for every multipole and table: interpolate it once
+    # every multipole and table shares x, so interpolate it once
     idx, frac = _uniform_stencil(x, inv_dx, n_x)
     inv_x = jnp.where(x > 1.0e-30, 1.0 / jnp.where(x > 1.0e-30, x, 1.0), 0.0)
 
@@ -315,9 +305,9 @@ def _projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype):
         prefactor = math.sqrt((ell + 2.0) * (ell + 1.0) * ell * (ell - 1.0))
         return interpolate(jlx2_tab[i]) * (prefactor * weights)
 
-    # Stored as (n_k_fine, n_ell, 3, n_chi), the operand layout of the
-    # contraction in :func:`theta_ell_batch`: with (n_ell, 3, n_k_fine, n_chi)
-    # XLA transposes the table (gigabytes at inference grids) at every call.
+    # Store as (n_k_fine, n_ell, 3, n_chi), the operand layout of the
+    # contraction in theta_ell_batch. With (n_ell, 3, n_k_fine, n_chi) XLA
+    # transposes the table, gigabytes at inference grids, on every call.
     bessel = jnp.stack(
         [
             jnp.transpose(rows(i, float(ell)), (1, 0, 2)).astype(dtype)
@@ -339,19 +329,18 @@ def _projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype):
 def theta_ell_batch(
     channels, tau, shift_idx, shift_w, band, interp, bessel, bessel_e, k_chunk=None
 ):
-    """``(Theta_l, E_l)`` at ``k_fine`` of a batch of cosmologies from their source channels, as matrix products.
+    """Return ``(Theta_l, E_l)`` at ``k_fine`` for a batch, each ``(n_c, n_ell, n_k_fine)`` in float64.
 
-    ``channels`` is ``(n_c, 5, n_k, n_tau)`` on the shared save grid; ``shift_idx``
-    and ``shift_w`` are each cosmology's stencil onto the shared ``chi`` grid
-    (:func:`lagrange_shift_stencil`); ``band`` is the ``(n_c, n_ell, n_k_fine)``
-    mask of :func:`k_band`; ``interp``, ``bessel`` and ``bessel_e`` come from
-    :func:`projection_operator`. Returns the temperature and E-mode transfer
-    functions, each ``(n_c, n_ell, n_k_fine)`` in float64.
+    ``channels`` is ``(n_c, 5, n_k, n_tau)`` on the shared save grid.
+    ``shift_idx`` and ``shift_w`` hold each cosmology's stencil from
+    :func:`lagrange_shift_stencil`, and ``band`` is the ``(n_c, n_ell,
+    n_k_fine)`` mask of :func:`k_band`. ``interp``, ``bessel`` and
+    ``bessel_e`` come from :func:`projection_operator`.
 
-    The fine wave modes are contracted ``k_chunk`` at a time (all at once by
-    default), each chunk for every cosmology: the Bessel table, gigabytes at
-    production sizes, is then read once a call whatever the batch, and only a
-    chunk's fine-``k`` sources are ever held. Chunking changes no sum.
+    The contraction handles ``k_chunk`` fine modes at a time (all by default)
+    for the whole batch. Each call then reads the Bessel table, gigabytes at
+    production sizes, only once, and holds only one chunk of refined sources.
+    Chunking does not change the result.
     """
 
     dtype = bessel.dtype
@@ -362,9 +351,9 @@ def theta_ell_batch(
     thetas, thetas_e = [], []
     for f0 in range(0, n_fine, step):
         f1 = min(f0 + step, n_fine)
-        # k_fine leading, the batch axis of the Bessel contraction: with (c, 3,
-        # k_fine, chi) XLA transposed the refined array first; (k_fine, l, c)
-        # out is the batched GEMM's own layout
+        # put k_fine first as the batch axis of the Bessel contraction. With
+        # (c, 3, k_fine, chi) XLA transposed the refined array first, and
+        # (k_fine, l, c) out is the batched GEMM's own layout
         refined = jnp.einsum("fk,cskt->fcst", interp[f0:f1], shifted)
         thetas.append(jnp.einsum("fcst,flst->flc", refined, bessel[f0:f1]))
         thetas_e.append(jnp.einsum("fct,flt->flc", refined[:, :, 2], bessel_e[f0:f1]))
@@ -377,19 +366,18 @@ def theta_ell_batch(
 
 
 def projection_k_chunk(n_cosmologies, n_k_fine, n_tau, dtype) -> int:
-    """Fine wave modes per chunk of :func:`theta_ell_batch` within :data:`PROJECTION_BUDGET_BYTES`."""
+    """Return how many fine modes per :func:`theta_ell_batch` chunk fit :data:`PROJECTION_BUDGET_BYTES`."""
 
     per_mode = 3 * n_cosmologies * n_tau * jnp.dtype(dtype).itemsize * 2
     return max(1, min(n_k_fine, int(PROJECTION_BUDGET_BYTES // max(per_mode, 1))))
 
 
 class TransferBatch(NamedTuple):
-    """The cosmology-dependent half of a batch's spectra, from :func:`~discocmb.main.compute_transfer_batch`.
+    """Cosmology-dependent transfer tables of a batch, from :func:`~discocmb.main.compute_transfer_batch`.
 
-    Everything the perturbation solve and the projection produce before the
-    primordial spectrum enters: the spectra are quadratic forms of these
-    tables with ``P_R(k)`` (:func:`~discocmb.spectra.spectra_from_transfer`), so a change of
-    ``A_s`` or ``n_s`` alone needs no new solve.
+    The spectra are quadratic forms of these tables weighted by ``P_R(k)``
+    (:func:`~discocmb.spectra.spectra_from_transfer`), so changing only
+    ``A_s`` or ``n_s`` needs no new solve.
     """
 
     theta: jax.Array  # (n_c, n_ell, n_k_fine) temperature transfer Theta_l(k), float64, zero outside each l's k band
@@ -404,7 +392,7 @@ class TransferBatch(NamedTuple):
 
 
 class TransferGrids(NamedTuple):
-    """The cosmology-independent arrays :func:`~discocmb.spectra.spectra_from_transfer` contracts a :class:`TransferBatch` with."""
+    """Cosmology-independent arrays that :func:`~discocmb.spectra.spectra_from_transfer` contracts a :class:`TransferBatch` with."""
 
     ells: np.ndarray
     k_fine: jax.Array
